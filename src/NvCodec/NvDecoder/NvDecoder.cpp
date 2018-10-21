@@ -11,21 +11,10 @@
 
 #include <iostream>
 #include <algorithm>
-#include <chrono>
 
 #include "nvcuvid.h"
 #include "../Utils/NvCodecUtils.h"
 #include "NvDecoder/NvDecoder.h"
-#include "../NvEncoder/nvEncodeAPI.h"
-
-//#define START_TIMER auto start = std::chrono::high_resolution_clock::now();
-//#define STOP_TIMER(print_message) std::cout << print_message << \
-//    std::chrono::duration_cast<std::chrono::milliseconds>( \
-//    std::chrono::high_resolution_clock::now() - start).count() \
-//    << " ms " << std::endl;
-
-#define START_TIMER ;
-#define STOP_TIMER(print_message) ;
 
 #define CUDA_DRVAPI_CALL( call )                                                                                                 \
     do                                                                                                                           \
@@ -125,14 +114,8 @@ static unsigned long GetNumDecodeSurfaces(cudaVideoCodec eCodec, unsigned int nW
     return 8;
 }
 
-/* Return value from HandleVideoSequence() are interpreted as   :
-*  0: fail, 1: suceeded, > 1: override dpb size of parser (set by CUVIDPARSERPARAMS::ulMaxNumDecodeSurfaces while creating parser) 
-*/
 int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
 {
-    START_TIMER
-    m_videoInfo.str("");
-    m_videoInfo.clear();
     m_videoInfo << "Video Input Information" << std::endl
         << "\tCodec        : " << GetVideoCodecString(pVideoFormat->codec) << std::endl
         << "\tFrame rate   : " << pVideoFormat->frame_rate.numerator << "/" << pVideoFormat->frame_rate.denominator 
@@ -148,8 +131,6 @@ int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
 
     int nDecodeSurface = GetNumDecodeSurfaces(pVideoFormat->codec, pVideoFormat->coded_width, pVideoFormat->coded_height);
 
-    // NvPipe tweak: Decode capabilities are only available in SDK 8
-#if (NVENCAPI_MAJOR_VERSION >= 8)
     CUVIDDECODECAPS decodecaps;
     memset(&decodecaps, 0, sizeof(decodecaps));
 
@@ -165,6 +146,7 @@ int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
         NVDEC_THROW_ERROR("Codec not supported on this GPU", CUDA_ERROR_NOT_SUPPORTED);
         return nDecodeSurface;
     }
+    
 
     if ((pVideoFormat->coded_width > decodecaps.nMaxWidth) || 
         (pVideoFormat->coded_height > decodecaps.nMaxHeight)){
@@ -192,12 +174,19 @@ int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
         NVDEC_THROW_ERROR(cErr, CUDA_ERROR_NOT_SUPPORTED);
         return nDecodeSurface;
     }
-#endif
     
     if (m_nWidth && m_nHeight) {
-
-        // cuvidCreateDecoder() has been called before, and now there's possible config change
-        return ReconfigureDecoder(pVideoFormat);
+    // cuvidCreateDecoder() has been called before, and now there's possible config change
+        if (m_eCodec == cudaVideoCodec_VP9) {
+        // For VP9, driver will handle the change
+            return nDecodeSurface;
+        }
+        if (pVideoFormat->coded_width == m_videoFormat.coded_width && pVideoFormat->coded_height == m_videoFormat.coded_height) {
+        // No resolution change
+            return nDecodeSurface;
+        }
+        NVDEC_THROW_ERROR("Dynamic resolution change isn't supported - decoded result may be incorrect", CUDA_ERROR_NOT_SUPPORTED);
+        return nDecodeSurface;
     }
 
     // eCodec has been set in the constructor (for parser). Here it's set again for potential correction
@@ -219,12 +208,6 @@ int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
     videoDecodeCreateInfo.vidLock = m_ctxLock;
     videoDecodeCreateInfo.ulWidth = pVideoFormat->coded_width;
     videoDecodeCreateInfo.ulHeight = pVideoFormat->coded_height;
-    if (m_nMaxWidth < (int)pVideoFormat->coded_width)
-        m_nMaxWidth = pVideoFormat->coded_width;
-    if (m_nMaxHeight < (int)pVideoFormat->coded_height)
-        m_nMaxHeight = pVideoFormat->coded_height;
-    videoDecodeCreateInfo.ulMaxWidth = m_nMaxWidth;
-    videoDecodeCreateInfo.ulMaxHeight = m_nMaxHeight;
 
     if (!(m_cropRect.r && m_cropRect.b) && !(m_resizeDim.w && m_resizeDim.h)) {
         m_nWidth = pVideoFormat->display_area.right - pVideoFormat->display_area.left;
@@ -253,11 +236,6 @@ int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
         videoDecodeCreateInfo.ulTargetHeight = m_nHeight;
     }
     m_nSurfaceHeight = videoDecodeCreateInfo.ulTargetHeight;
-    m_nSurfaceWidth = videoDecodeCreateInfo.ulTargetWidth;
-    m_displayRect.b = videoDecodeCreateInfo.display_area.bottom;
-    m_displayRect.t = videoDecodeCreateInfo.display_area.top;
-    m_displayRect.l = videoDecodeCreateInfo.display_area.left;
-    m_displayRect.r = videoDecodeCreateInfo.display_area.right;
 
     m_videoInfo << "Video Decoding Params:" << std::endl
         << "\tNum Surfaces : " << videoDecodeCreateInfo.ulNumDecodeSurfaces << std::endl
@@ -271,178 +249,20 @@ int NvDecoder::HandleVideoSequence(CUVIDEOFORMAT *pVideoFormat)
     CUDA_DRVAPI_CALL(cuCtxPushCurrent(m_cuContext));
     NVDEC_API_CALL(cuvidCreateDecoder(&m_hDecoder, &videoDecodeCreateInfo));
     CUDA_DRVAPI_CALL(cuCtxPopCurrent(NULL));
-    STOP_TIMER("Session Initialization Time: ");
     return nDecodeSurface;
 }
 
-int NvDecoder::ReconfigureDecoder(CUVIDEOFORMAT *pVideoFormat)
-{
-    if (pVideoFormat->bit_depth_luma_minus8 != m_videoFormat.bit_depth_luma_minus8 || pVideoFormat->bit_depth_chroma_minus8 != m_videoFormat.bit_depth_chroma_minus8){
-
-        NVDEC_THROW_ERROR("Reconfigure Not supported for bit depth change", CUDA_ERROR_NOT_SUPPORTED);
-    }
-
-    if (pVideoFormat->chroma_format != m_videoFormat.chroma_format) {
-
-        NVDEC_THROW_ERROR("Reconfigure Not supported for chroma format change", CUDA_ERROR_NOT_SUPPORTED);
-    }
-
-    bool bDecodeResChange = !(pVideoFormat->coded_width == m_videoFormat.coded_width && pVideoFormat->coded_height == m_videoFormat.coded_height);
-    bool bDisplayRectChange = !(pVideoFormat->display_area.bottom == m_videoFormat.display_area.bottom && pVideoFormat->display_area.top == m_videoFormat.display_area.top \
-        && pVideoFormat->display_area.left == m_videoFormat.display_area.left && pVideoFormat->display_area.right == m_videoFormat.display_area.right);
-
-    int nDecodeSurface = GetNumDecodeSurfaces(pVideoFormat->codec, pVideoFormat->coded_width, pVideoFormat->coded_height);
-
-    if ((pVideoFormat->coded_width > m_nMaxWidth) || (pVideoFormat->coded_height > m_nMaxHeight)) {
-        // For VP9, let driver  handle the change if new width/height > maxwidth/maxheight
-        if ((m_eCodec != cudaVideoCodec_VP9) || m_bReconfigExternal)
-        {
-            NVDEC_THROW_ERROR("Reconfigure Not supported when width/height > maxwidth/maxheight", CUDA_ERROR_NOT_SUPPORTED);
-        }
-        return 1;
-    }
-
-    if (!bDecodeResChange && !m_bReconfigExtPPChange) {
-        // if the coded_width/coded_height hasn't changed but display resolution has changed, then need to update width/height for 
-        // correct output without cropping. Example : 1920x1080 vs 1920x1088 
-        if (bDisplayRectChange)
-        {
-            m_nWidth = pVideoFormat->display_area.right - pVideoFormat->display_area.left;
-            m_nHeight = pVideoFormat->display_area.bottom - pVideoFormat->display_area.top;
-        }
-
-        // no need for reconfigureDecoder(). Just return
-        return 1;
-    }
-
-    CUVIDRECONFIGUREDECODERINFO reconfigParams = { 0 };
-
-    reconfigParams.ulWidth = m_videoFormat.coded_width = pVideoFormat->coded_width;
-    reconfigParams.ulHeight = m_videoFormat.coded_height = pVideoFormat->coded_height;
-
-    // Dont change display rect and get scaled output from decoder. This will help display app to present apps smoothly
-    reconfigParams.display_area.bottom = m_displayRect.b;
-    reconfigParams.display_area.top = m_displayRect.t;
-    reconfigParams.display_area.left = m_displayRect.l;
-    reconfigParams.display_area.right = m_displayRect.r;
-    reconfigParams.ulTargetWidth = m_nSurfaceWidth;
-    reconfigParams.ulTargetHeight = m_nSurfaceHeight;
-
-    // If external reconfigure is called along with resolution change even if post processing params is not changed,
-    // do full reconfigure params update
-    if ((m_bReconfigExternal && bDecodeResChange) || m_bReconfigExtPPChange) {
-        // update display rect and target resolution if requested explicitely
-        m_bReconfigExternal = false;
-        m_bReconfigExtPPChange = false;
-        m_videoFormat = *pVideoFormat;
-        if (!(m_cropRect.r && m_cropRect.b) && !(m_resizeDim.w && m_resizeDim.h)) {
-            m_nWidth = pVideoFormat->display_area.right - pVideoFormat->display_area.left;
-            m_nHeight = pVideoFormat->display_area.bottom - pVideoFormat->display_area.top;
-            reconfigParams.ulTargetWidth = pVideoFormat->coded_width;
-            reconfigParams.ulTargetHeight = pVideoFormat->coded_height;
-        }
-        else {
-            if (m_resizeDim.w && m_resizeDim.h) {
-                reconfigParams.display_area.left = pVideoFormat->display_area.left;
-                reconfigParams.display_area.top = pVideoFormat->display_area.top;
-                reconfigParams.display_area.right = pVideoFormat->display_area.right;
-                reconfigParams.display_area.bottom = pVideoFormat->display_area.bottom;
-                m_nWidth = m_resizeDim.w;
-                m_nHeight = m_resizeDim.h;
-            }
-
-            if (m_cropRect.r && m_cropRect.b) {
-                reconfigParams.display_area.left = m_cropRect.l;
-                reconfigParams.display_area.top = m_cropRect.t;
-                reconfigParams.display_area.right = m_cropRect.r;
-                reconfigParams.display_area.bottom = m_cropRect.b;
-                m_nWidth = m_cropRect.r - m_cropRect.l;
-                m_nHeight = m_cropRect.b - m_cropRect.t;
-            }
-            reconfigParams.ulTargetWidth = m_nWidth;
-            reconfigParams.ulTargetHeight = m_nHeight;
-        }
-
-        m_nSurfaceHeight = reconfigParams.ulTargetHeight;
-        m_nSurfaceWidth = reconfigParams.ulTargetWidth;
-        m_displayRect.b = reconfigParams.display_area.bottom;
-        m_displayRect.t = reconfigParams.display_area.top;
-        m_displayRect.l = reconfigParams.display_area.left;
-        m_displayRect.r = reconfigParams.display_area.right;
-    }
-    
-    reconfigParams.ulNumDecodeSurfaces = nDecodeSurface;
-
-    START_TIMER
-    CUDA_DRVAPI_CALL(cuCtxPushCurrent(m_cuContext));
-    NVDEC_API_CALL(cuvidReconfigureDecoder(m_hDecoder, &reconfigParams));
-    CUDA_DRVAPI_CALL(cuCtxPopCurrent(NULL));
-    STOP_TIMER("Session Reconfigure Time: ");
-
-    return nDecodeSurface;
-}
-
-int NvDecoder::setReconfigParams(const Rect *pCropRect, const Dim *pResizeDim)
-{
-    m_bReconfigExternal = true;
-    m_bReconfigExtPPChange = false;
-    if (pCropRect)
-    {
-        if (!((pCropRect->t == m_cropRect.t) && (pCropRect->l == m_cropRect.l) &&
-            (pCropRect->b == m_cropRect.b) && (pCropRect->r == m_cropRect.r)))
-        {
-            m_bReconfigExtPPChange = true;
-            m_cropRect = *pCropRect;
-        }
-    }
-    if (pResizeDim)
-    {
-        if (!((pResizeDim->w == m_resizeDim.w) && (pResizeDim->h == m_resizeDim.h)))
-        {
-            m_bReconfigExtPPChange = true;
-            m_resizeDim = *pResizeDim;
-        }
-    }
-
-    // Clear existing output buffers of different size
-    uint8_t *pFrame = NULL;
-    while (!m_vpFrame.empty())
-    {
-        pFrame = m_vpFrame.back();
-        m_vpFrame.pop_back();
-        if (m_bUseDeviceFrame)
-        {
-            CUDA_DRVAPI_CALL(cuCtxPushCurrent(m_cuContext));
-            CUDA_DRVAPI_CALL(cuMemFree((CUdeviceptr)pFrame));
-            CUDA_DRVAPI_CALL(cuCtxPopCurrent(NULL));
-        }
-        else
-        {
-            delete pFrame;
-        }
-    }
-    m_vpFrameRet.clear();
-
-    return 1;
-}
-
-/* Return value from HandlePictureDecode() are interpreted as:
-*  0: fail, >=1: suceeded 
-*/
 int NvDecoder::HandlePictureDecode(CUVIDPICPARAMS *pPicParams) {
     if (!m_hDecoder) 
     {
         NVDEC_THROW_ERROR("Decoder not initialized.", CUDA_ERROR_NOT_INITIALIZED);
         return false;
     }
-    m_nPicNumInDecodeOrder[pPicParams->CurrPicIdx] = m_nDecodePicCnt++;
+
     NVDEC_API_CALL(cuvidDecodePicture(m_hDecoder, pPicParams));
     return 1;
 }
 
-/* Return value from HandlePictureDisplay() are interpreted as:
-*  0: fail, >=1: suceeded 
-*/
 int NvDecoder::HandlePictureDisplay(CUVIDPARSERDISPINFO *pDispInfo) {
     CUVIDPROCPARAMS videoProcessingParameters = {};
     videoProcessingParameters.progressive_frame = pDispInfo->progressive_frame;
@@ -455,14 +275,6 @@ int NvDecoder::HandlePictureDisplay(CUVIDPARSERDISPINFO *pDispInfo) {
     unsigned int nSrcPitch = 0;
     NVDEC_API_CALL(cuvidMapVideoFrame(m_hDecoder, pDispInfo->picture_index, &dpSrcFrame,
         &nSrcPitch, &videoProcessingParameters));
-
-    CUVIDGETDECODESTATUS DecodeStatus;
-    memset(&DecodeStatus, 0, sizeof(DecodeStatus));
-    CUresult result = cuvidGetDecodeStatus(m_hDecoder, pDispInfo->picture_index, &DecodeStatus);
-    if (result == CUDA_SUCCESS && (DecodeStatus.decodeStatus == cuvidDecodeStatus_Error || DecodeStatus.decodeStatus == cuvidDecodeStatus_Error_Concealed))
-    {
-        printf("Decode Error occurred for picture %d\n", m_nPicNumInDecodeOrder[pDispInfo->picture_index]);
-    }
     uint8_t *pDecodedFrame = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_mtxVPFrame);
@@ -521,9 +333,8 @@ int NvDecoder::HandlePictureDisplay(CUVIDPARSERDISPINFO *pDispInfo) {
 }
 
 NvDecoder::NvDecoder(CUcontext cuContext, int nWidth, int nHeight, bool bUseDeviceFrame, cudaVideoCodec eCodec, std::mutex *pMutex,
-    bool bLowLatency, bool bDeviceFramePitched, const Rect *pCropRect, const Dim *pResizeDim, int maxWidth, int maxHeight) :
-    m_cuContext(cuContext), m_bUseDeviceFrame(bUseDeviceFrame), m_eCodec(eCodec), m_pMutex(pMutex), m_bDeviceFramePitched(bDeviceFramePitched),
-    m_nMaxWidth (maxWidth), m_nMaxHeight(maxHeight)
+    bool bLowLatency, bool bDeviceFramePitched, const Rect *pCropRect, const Dim *pResizeDim) :
+    m_cuContext(cuContext), m_bUseDeviceFrame(bUseDeviceFrame), m_eCodec(eCodec), m_pMutex(pMutex), m_bDeviceFramePitched(bDeviceFramePitched)
 {
     if (pCropRect) m_cropRect = *pCropRect;
     if (pResizeDim) m_resizeDim = *pResizeDim;
@@ -545,7 +356,6 @@ NvDecoder::NvDecoder(CUcontext cuContext, int nWidth, int nHeight, bool bUseDevi
 
 NvDecoder::~NvDecoder() {
 
-    START_TIMER
     cuCtxPushCurrent(m_cuContext);
     cuCtxPopCurrent(NULL);
 
@@ -580,7 +390,6 @@ NvDecoder::~NvDecoder() {
         }
     }
     cuvidCtxLockDestroy(m_ctxLock);
-    STOP_TIMER("Session Deinitialization Time: ");
 }
 
 bool NvDecoder::Decode(const uint8_t *pData, int nSize, uint8_t ***pppFrame, int *pnFrameReturned, uint32_t flags, int64_t **ppTimestamp, int64_t timestamp, CUstream stream)
